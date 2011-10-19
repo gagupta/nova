@@ -166,7 +166,8 @@ class VolumeController(object):
 
         metadata = vol.get('metadata', None)
 
-        new_volume = self.volume_api.create(context, size, vol.get('snapshot_id'),
+        new_volume = self.volume_api.create(context, size,
+                                            vol.get('snapshot_id'),
                                             vol.get('display_name'),
                                             vol.get('display_description'),
                                             volume_type=vol_type,
@@ -338,6 +339,118 @@ class BootFromVolumeController(servers.Controller):
         return data.get('block_device_mapping')
 
 
+def _translate_snapshot_detail_view(context, vol):
+    """Maps keys for snapshots details view."""
+
+    d = _translate_snapshot_summary_view(context, vol)
+
+    # NOTE(gagupta): No additional data / lookups at the moment
+    return d
+
+
+def _translate_snapshot_summary_view(context, vol):
+    """Maps keys for snapshots summary view."""
+    d = {}
+
+    d['id'] = vol['id']
+    d['volumeId'] = vol['volume_id']
+    d['status'] = vol['status']
+    # NOTE(gagupta): We map volume_size as the snapshot size
+    d['size'] = vol['volume_size']
+    d['createdAt'] = vol['created_at']
+    d['displayName'] = vol['display_name']
+    d['displayDescription'] = vol['display_description']
+    return d
+
+class SnapshotController(object):
+    """The Volumes API controller for the OpenStack API."""
+
+    _serialization_metadata = {
+        'application/xml': {
+            "attributes": {
+                "snapshot": [
+                    "id",
+                    "volumeId",
+                    "status",
+                    "size",
+                    "createdAt",
+                    "displayName",
+                    "displayDescription",
+                    ]}}}
+
+    def __init__(self):
+        self.volume_api = volume.API()
+        super(SnapshotController, self).__init__()
+
+    def show(self, req, id):
+        """Return data about the given snapshot."""
+        context = req.environ['nova.context']
+
+        try:
+            vol = self.volume_api.get_snapshot(context, id)
+        except exception.NotFound:
+            return faults.Fault(exc.HTTPNotFound())
+
+        return {'snapshot': _translate_snapshot_detail_view(context, vol)}
+
+    def delete(self, req, id):
+        """Delete a snapshot."""
+        context = req.environ['nova.context']
+
+        LOG.audit(_("Delete snapshot with id: %s"), id, context=context)
+
+        try:
+            self.volume_api.delete_snapshot(context, snapshot_id=id)
+        except exception.NotFound:
+            return faults.Fault(exc.HTTPNotFound())
+        return webob.Response(status_int=202)
+
+    def index(self, req):
+        """Returns a summary list of snapshots."""
+        return self._items(req, entity_maker=_translate_snapshot_summary_view)
+
+    def detail(self, req):
+        """Returns a detailed list of snapshots."""
+        return self._items(req, entity_maker=_translate_snapshot_detail_view)
+
+    def _items(self, req, entity_maker):
+        """Returns a list of snapshots, transformed through entity_maker."""
+        context = req.environ['nova.context']
+
+        snapshots = self.volume_api.get_all_snapshots(context)
+        limited_list = common.limited(snapshots, req)
+        res = [entity_maker(context, snapshot) for snapshot in limited_list]
+        return {'snapshots': res}
+
+    def create(self, req, body):
+        """Creates a new snapshot."""
+        context = req.environ['nova.context']
+
+        if not body:
+            return faults.Fault(exc.HTTPUnprocessableEntity())
+
+        snapshot = body['snapshot']
+        volume_id = snapshot['volume_id']
+        force = snapshot.get('force', False)
+        LOG.audit(_("Create snapshot from volume %s"), volume_id,
+                context=context)
+
+        if force:
+            new_snapshot = self.volume_api.create_snapshot_force(context,
+                                            volume_id,
+                                            snapshot.get('display_name'),
+                                            snapshot.get('display_description'))
+        else:
+            new_snapshot = self.volume_api.create_snapshot(context,
+                                            volume_id,
+                                            snapshot.get('display_name'),
+                                            snapshot.get('display_description'))
+
+        retval = _translate_snapshot_detail_view(context, new_snapshot)
+
+        return {'snapshot': retval}
+
+
 class Volumes(extensions.ExtensionDescriptor):
     def get_name(self):
         return "Volumes"
@@ -373,6 +486,11 @@ class Volumes(extensions.ExtensionDescriptor):
 
         res = extensions.ResourceExtension('os-volumes_boot',
                                            BootFromVolumeController())
+        resources.append(res)
+        
+        res = extensions.ResourceExtension('os-snapshots',
+                                        SnapshotController(),
+                                        collection_actions={'detail': 'GET'})
         resources.append(res)
 
         return resources
